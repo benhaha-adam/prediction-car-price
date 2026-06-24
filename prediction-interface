@@ -1,0 +1,1012 @@
+"""
+=============================================================
+  PREDICT.PY — Prédiction sans réentraînement
+  Branch : feature/model-persistence
+=============================================================
+  Prérequis : avoir exécuté train.py au moins une fois.
+
+  Usages :
+    python predict.py
+      → interface graphique Tkinter (mode par défaut)
+
+    python predict.py --cli
+      → saisie interactive en ligne de commande
+
+    python predict.py --cli --model random_forest
+      → CLI : utilise spécifiquement random_forest.joblib
+
+    python predict.py --cli --all
+      → CLI : affiche les prédictions de TOUS les modèles
+
+    python predict.py --csv mon_fichier.csv
+      → batch : prédit les prix pour chaque ligne du CSV
+        (utilise le meilleur modèle par défaut)
+
+    python predict.py --csv mon_fichier.csv --all
+      → batch avec TOUS les modèles
+
+    python predict.py --models-dir path/to/models/
+      → dossier de modèles personnalisé
+=============================================================
+
+CORRECTIFS vs version précédente
+─────────────────────────────────
+  BUG 1 – Mode interactif s'exécutait TOUJOURS au niveau module,
+           même en mode --csv → les ask_int() bloquaient après le batch.
+           FIX : tout le code interactif est dans run_cli(), appelé
+                 uniquement si --cli est passé.
+
+  BUG 2 – --model / --all ignorés en mode interactif car la sélection
+           du modèle en bas du script ne les relisait pas correctement.
+           FIX : logique centralisée dans select_model_names().
+
+  BUG 3 – Division par zéro dans predict_price() quand car_age == 0
+           (voiture de l'année courante). Le .replace(0, 1) n'était
+           appliqué que dans un des deux chemins de calcul.
+           FIX : helper safe_div() utilisé partout.
+
+  BUG 4 – Typo dans le docstring du header (=====p=====).
+           FIX : corrigé.
+
+  BUG 5 – En mode batch sans --all ni --model, le code tombait sur
+           AVAILABLE_MODELS au lieu de [BEST_MODEL].
+           FIX : select_model_names() normalise tous les cas.
+=============================================================
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import sys
+import json
+import argparse
+import math
+import threading
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import joblib
+
+
+# ─────────────────────────────────────────────
+# ARGUMENTS
+# ─────────────────────────────────────────────
+parser = argparse.ArgumentParser(
+    description="Charge les modèles et prédit sans réentraînement."
+)
+parser.add_argument("--model",      type=str, default=None,
+                    help="Nom du modèle (ex: random_forest)")
+parser.add_argument("--all",        action="store_true",
+                    help="Utiliser tous les modèles sauvegardés")
+parser.add_argument("--csv",        type=str, default=None,
+                    help="Fichier CSV à prédire (mode batch)")
+parser.add_argument("--models-dir", type=str, default="models/",
+                    help="Dossier contenant les .joblib")
+parser.add_argument("--cli",        action="store_true",
+                    help="Forcer le mode ligne de commande (pas de GUI)")
+args = parser.parse_args()
+
+MODELS_DIR = Path(args.models_dir)
+
+
+# ─────────────────────────────────────────────
+# 1. CHARGEMENT DES MÉTADONNÉES
+# ─────────────────────────────────────────────
+meta_path = MODELS_DIR / "training_metadata.json"
+
+if not meta_path.exists():
+    print(f"\nERREUR : {meta_path} introuvable.")
+    print("  Lancez d'abord : python train.py")
+    sys.exit(1)
+
+with open(meta_path, "r", encoding="utf-8") as f:
+    meta = json.load(f)
+
+ALL_FEATURES     = meta["all_features"]
+NUM_FEATURES     = meta["num_features"]
+CAT_FEATURES     = meta["cat_features"]
+ORD_FEATURES     = meta["ord_features"]
+BEST_MODEL       = meta["best_model"]
+AVAILABLE_MODELS = meta["models"]
+CAT_VALUES       = meta["cat_values"]
+CURRENT_YEAR     = meta["current_year"]
+RESULTS          = meta["results"]
+
+
+# ─────────────────────────────────────────────
+# 2. UTILITAIRES PARTAGÉS (CLI + GUI + batch)
+# ─────────────────────────────────────────────
+
+def safe_div(a: float, b: float, fallback: float = 1.0) -> float:
+    """Division sûre — évite ZeroDivisionError quand b == 0."""
+    return a / b if b != 0 else fallback
+
+
+def select_model_names() -> list[str]:
+    """
+    FIX BUG 2 & 5 — centralise la sélection des modèles.
+    Priorité : --model  >  --all  >  BEST_MODEL uniquement.
+    """
+    if args.model:
+        if args.model not in AVAILABLE_MODELS:
+            print(f"\nERREUR : modèle '{args.model}' inconnu.")
+            print(f"  Disponibles : {AVAILABLE_MODELS}")
+            sys.exit(1)
+        return [args.model]
+    if args.all:
+        return list(AVAILABLE_MODELS)
+    return [BEST_MODEL]
+
+
+def load_model(name: str):
+    """Charge un pipeline joblib depuis le dossier models/."""
+    path = MODELS_DIR / f"{name}.joblib"
+    if not path.exists():
+        print(f"\nERREUR : {path} introuvable. Relancez train.py.")
+        sys.exit(1)
+    return joblib.load(path)
+
+
+def apply_feature_engineering(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    FIX BUG 3 — feature engineering robuste avec safe_div().
+    Ajoute car_age, mileage_per_year, hp_per_year si absents.
+    """
+    if "year" not in data.columns or "car_age" in data.columns:
+        return data          # déjà calculé ou impossible
+
+    data = data.copy()
+    data["car_age"] = (CURRENT_YEAR - data["year"]).clip(lower=0)
+
+    # safe_div vectorisé via np.where
+    age_safe = np.where(data["car_age"] == 0, 1, data["car_age"])
+
+    if "mileage" in data.columns:
+        data["mileage_per_year"] = data["mileage"] / age_safe
+
+    if "engine_hp" in data.columns:
+        data["hp_per_year"] = data["engine_hp"] / age_safe
+
+    return data
+
+
+def predict_price(pipe, data: pd.DataFrame) -> np.ndarray:
+    """
+    Prédit les prix à partir d'un DataFrame.
+    Retourne un array de prix en $ (toujours ≥ 0).
+    """
+    data = apply_feature_engineering(data)
+
+    # Aligner exactement les colonnes de l'entraînement
+    for col in ALL_FEATURES:
+        if col not in data.columns:
+            data[col] = np.nan
+    data = data[ALL_FEATURES]
+
+    y_log  = pipe.predict(data)
+    y_orig = np.clip(np.expm1(y_log), a_min=0, a_max=None)
+    return y_orig
+
+
+def build_input_df(row_dict: dict) -> pd.DataFrame:
+    """Construit un DataFrame d'une ligne aligné sur ALL_FEATURES."""
+    row = {k: v for k, v in row_dict.items() if k in ALL_FEATURES}
+    # Colonnes manquantes → NaN
+    for col in ALL_FEATURES:
+        if col not in row:
+            row[col] = np.nan
+    return pd.DataFrame([row])[ALL_FEATURES]
+
+
+def collect_row_from_values(
+    year, mileage, engine_hp, owner_count, brand_popularity,
+    make, fuel_type, drivetrain, body_type, transmission,
+    exterior_color, interior_color, seller_type, accident_history,
+    condition
+) -> dict:
+    """Construit le dict de features à partir de valeurs brutes."""
+    car_age          = max(CURRENT_YEAR - int(year), 0)
+    mileage_per_year = safe_div(float(mileage), max(car_age, 1))
+    hp_per_year      = safe_div(float(engine_hp), max(car_age, 1))
+
+    return dict(
+        year             = int(year),
+        mileage          = float(mileage),
+        engine_hp        = float(engine_hp),
+        owner_count      = int(owner_count),
+        brand_popularity = float(brand_popularity),
+        car_age          = car_age,
+        mileage_per_year = mileage_per_year,
+        hp_per_year      = hp_per_year,
+        make             = str(make),
+        fuel_type        = str(fuel_type),
+        drivetrain       = str(drivetrain),
+        body_type        = str(body_type),
+        transmission     = str(transmission),
+        exterior_color   = str(exterior_color),
+        interior_color   = str(interior_color),
+        seller_type      = str(seller_type),
+        accident_history = str(accident_history),
+        condition        = str(condition),
+    )
+
+
+# ─────────────────────────────────────────────
+# 3A. MODE BATCH (--csv)
+# ─────────────────────────────────────────────
+if args.csv:
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        print(f"\nERREUR : fichier introuvable : {csv_path}")
+        sys.exit(1)
+
+    print(f"\n{'─'*50}")
+    print(f"Mode batch : {csv_path}")
+    batch_df = pd.read_csv(csv_path)
+    batch_df.columns = batch_df.columns.str.strip().str.lower()
+    print(f"  {len(batch_df):,} lignes chargées")
+
+    model_names = select_model_names()   # FIX BUG 2 & 5
+    output_df   = batch_df.copy()
+
+    for name in model_names:
+        print(f"\n  Prédiction avec {name}...")
+        pipe  = load_model(name)
+        preds = predict_price(pipe, batch_df.copy())
+        output_df[f"predicted_price_{name}"] = preds.round(2)
+        print(
+            f"    Min : ${preds.min():,.0f}  |  "
+            f"Médiane : ${np.median(preds):,.0f}  |  "
+            f"Max : ${preds.max():,.0f}"
+        )
+
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = csv_path.parent / f"predictions_output_{ts}.csv"
+    output_df.to_csv(out_path, index=False)
+    print(f"\n  Résultats exportés : {out_path}")
+    sys.exit(0)
+
+
+# ─────────────────────────────────────────────
+# 3B. MODE CLI (--cli)   FIX BUG 1 : encapsulé dans une fonction
+# ─────────────────────────────────────────────
+def run_cli():
+    print("=" * 66)
+    print("  PREDICT.PY — Prédiction avec modèles pré-entraînés")
+    print("=" * 66)
+    print(f"\n  Entraîné le    : {meta['trained_at'][:19]}")
+    print(f"  Taille dataset : {meta['sample_size']:,} lignes")
+    print(f"  Meilleur modèle: {BEST_MODEL}  "
+          f"(R² = {RESULTS[BEST_MODEL]['R2']:.3f})")
+    print("\n  Modèles disponibles :")
+    for m in AVAILABLE_MODELS:
+        r    = RESULTS[m]
+        star = " <-- meilleur" if m == BEST_MODEL else ""
+        print(f"    {m:<22}  R²={r['R2']:.3f}  MAE=${r['MAE']:,.0f}{star}")
+
+    # ── helpers saisie ──
+    def ask_int(prompt, min_v=None, max_v=None):
+        while True:
+            raw = input(prompt).strip()
+            try:
+                v = int(raw)
+            except ValueError:
+                print("  Veuillez saisir un entier.")
+                continue
+            if min_v is not None and v < min_v:
+                print(f"  Minimum : {min_v}")
+                continue
+            if max_v is not None and v > max_v:
+                print(f"  Maximum : {max_v}")
+                continue
+            return v
+
+    def ask_float(prompt, min_v=None):
+        while True:
+            raw = input(prompt).strip().replace(",", ".")
+            try:
+                v = float(raw)
+            except ValueError:
+                print("  Veuillez saisir un nombre.")
+                continue
+            if min_v is not None and v < min_v:
+                print(f"  Minimum : {min_v}")
+                continue
+            return v
+
+    def ask_choice(prompt, choices):
+        cl = {c.lower(): c for c in choices}
+        while True:
+            print(f"  Options : {', '.join(choices)}")
+            raw = input(prompt).strip()
+            if raw.lower() in cl:
+                return cl[raw.lower()]
+            print("  Valeur invalide — réessayez.")
+
+    print(f"\n{'═'*66}")
+    print("  Saisie du véhicule à évaluer")
+    print(f"{'═'*66}")
+
+    year_in      = ask_int("Année de fabrication : ", 1990, CURRENT_YEAR)
+    mileage_in   = ask_int("Kilométrage (km) : ", 0)
+    engine_hp_in = (ask_int("Puissance moteur (ch) : ", 50, 1500)
+                    if "engine_hp" in NUM_FEATURES else 150)
+    owner_cnt    = ask_int("Nb de propriétaires précédents : ", 0, 20)
+    brand_pop    = ask_float("Popularité de la marque (0–100) : ", 0)
+
+    make_in     = ask_choice("Marque (make) : ",
+                             CAT_VALUES.get("make", ["Toyota"]))
+    fuel_in     = ask_choice("Type de carburant : ",
+                             CAT_VALUES.get("fuel_type", ["Gasoline"]))
+    drive_in    = ask_choice("Traction (drivetrain) : ",
+                             CAT_VALUES.get("drivetrain", ["FWD"]))
+    body_in     = ask_choice("Carrosserie (body_type) : ",
+                             CAT_VALUES.get("body_type", ["Sedan"]))
+    trans_in    = ask_choice("Transmission : ",
+                             CAT_VALUES.get("transmission", ["Automatic"]))
+    acc_in      = ask_choice("Historique accidents : ",
+                             CAT_VALUES.get("accident_history", ["No"]))
+    sell_in     = ask_choice("Type de vendeur : ",
+                             CAT_VALUES.get("seller_type", ["Dealer"]))
+    ext_col_in  = ask_choice("Couleur extérieure : ",
+                             CAT_VALUES.get("exterior_color", ["White"]))
+    int_col_in  = ask_choice("Couleur intérieure : ",
+                             CAT_VALUES.get("interior_color", ["Black"]))
+    cond_in     = (ask_choice("Condition du véhicule : ",
+                              CAT_VALUES.get("condition",
+                                            ["Poor", "Fair", "Good", "Excellent"]))
+                   if ORD_FEATURES else "Good")
+
+    row_dict = collect_row_from_values(
+        year_in, mileage_in, engine_hp_in, owner_cnt, brand_pop,
+        make_in, fuel_in, drive_in, body_in, trans_in,
+        ext_col_in, int_col_in, sell_in, acc_in, cond_in
+    )
+    input_df = build_input_df(row_dict)
+
+    print(f"\n{'─'*50}")
+    print("Caractéristiques saisies :")
+    for col, val in input_df.iloc[0].items():
+        print(f"  {col:<25}: {val}")
+
+    model_names = select_model_names()   # FIX BUG 2
+
+    print(f"\n{'-'*70}")
+    print(f"  {'Modèle':<22} {'Prix estimé':>16}  {'R²':>10}  {'MAE':>11}")
+    print(f"{'-'*70}")
+
+    for name in model_names:
+        pipe  = load_model(name)
+        pred  = predict_price(pipe, input_df.copy())[0]
+        r     = RESULTS[name]
+        star  = " [BEST]" if name == BEST_MODEL else ""
+        print(
+            f"  {name:<22} ${pred:>11,.2f}"
+            f"   R²={r['R2']:.3f}"
+            f"   MAE=${r['MAE']:>9,.0f}{star}"
+        )
+
+    print(f"{'─'*60}")
+    print(f"\n  Entraînement effectué le : {meta['trained_at'][:19]}")
+    print(f"  Modèles chargés depuis   : {MODELS_DIR}/")
+    print(f"\n{'═'*66}\n")
+
+
+# ─────────────────────────────────────────────
+# 3C. MODE GRAPHIQUE TKINTER (défaut si ni --cli ni --csv)
+# ─────────────────────────────────────────────
+
+# ── Palette ──────────────────────────────────
+_C = dict(
+    BG      = "#16181F",   # noir bleuté profond
+    BG2     = "#1E2029",   # panneaux
+    BG3     = "#272B38",   # champs de saisie
+    BG4     = "#2D3242",   # hover / sélection
+    ACCENT  = "#F0A500",   # ambre (valeur)
+    ACCENT2 = "#FFD166",   # ambre clair
+    SUCCESS = "#50C896",   # vert confirmé
+    DANGER  = "#E05555",   # rouge erreur
+    TEXT    = "#E8EAF2",   # texte principal
+    TEXT2   = "#7A8099",   # texte secondaire
+    BORDER  = "#353A50",   # séparateurs
+)
+
+
+def run_gui():
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+
+    # ── ttk style factory ────────────────────
+    def setup_styles(root):
+        s = ttk.Style(root)
+        s.theme_use("clam")
+
+        combo_cfg = dict(
+            fieldbackground=_C["BG3"], background=_C["BG3"],
+            foreground=_C["TEXT"], arrowcolor=_C["ACCENT"],
+            bordercolor=_C["BORDER"], lightcolor=_C["BG3"],
+            darkcolor=_C["BG3"], selectbackground=_C["BG4"],
+            selectforeground=_C["TEXT"], insertcolor=_C["TEXT"],
+        )
+        s.configure("TCombobox", **combo_cfg)
+        s.map("TCombobox",
+              fieldbackground=[("readonly", _C["BG3"])],
+              foreground=[("readonly", _C["TEXT"])])
+
+        s.configure("Accent.TButton",
+                    background=_C["ACCENT"], foreground="#15161C",
+                    font=("Segoe UI", 11, "bold"),
+                    borderwidth=0, relief="flat", padding=(20, 9))
+        s.map("Accent.TButton",
+              background=[("active", _C["ACCENT2"]),
+                          ("pressed", "#C08000")])
+
+        s.configure("Ghost.TButton",
+                    background=_C["BG2"], foreground=_C["TEXT2"],
+                    font=("Segoe UI", 9),
+                    borderwidth=1, relief="flat", padding=(10, 5))
+        s.map("Ghost.TButton",
+              background=[("active", _C["BG4"])],
+              foreground=[("active", _C["TEXT"])])
+
+        s.configure("TScrollbar",
+                    background=_C["BG3"], troughcolor=_C["BG2"],
+                    bordercolor=_C["BG2"], arrowcolor=_C["ACCENT"])
+
+    # ── Gauge animée ─────────────────────────
+    class GaugeMeter(tk.Canvas):
+        MAX_PRICE = 200_000
+
+        def __init__(self, parent, **kw):
+            super().__init__(parent,
+                             bg=_C["BG2"], highlightthickness=0,
+                             width=300, height=170, **kw)
+            self._target  = 0.0
+            self._current = 0.0
+            self._anim_id = None
+            self._draw_static()
+            self._arc_id   = None
+            self._needle_id = None
+            self._price_id = self.create_text(
+                150, 100, text="—",
+                font=("Segoe UI", 26, "bold"),
+                fill=_C["TEXT"], anchor="center"
+            )
+            self._sub_id = self.create_text(
+                150, 126, text="estimation (meilleur modèle)",
+                font=("Segoe UI", 8),
+                fill=_C["TEXT2"], anchor="center"
+            )
+
+        def _draw_static(self):
+            # Arc de fond
+            self.create_arc(20, 14, 280, 194,
+                            start=180, extent=180,
+                            style="arc", outline=_C["BG3"], width=16)
+            # Ticks
+            cx, cy, r = 150, 150, 115
+            for i in range(11):
+                a  = math.radians(180 - i * 18)
+                x1 = cx + (r - 10) * math.cos(a)
+                y1 = cy - (r - 10) * math.sin(a)
+                x2 = cx + r * math.cos(a)
+                y2 = cy - r * math.sin(a)
+                self.create_line(x1, y1, x2, y2,
+                                 fill=_C["BORDER"], width=2)
+
+        def set_value(self, price: float):
+            self._target = min(max(price, 0), self.MAX_PRICE)
+            if self._anim_id:
+                self.after_cancel(self._anim_id)
+            self._animate()
+
+        def _animate(self):
+            diff = self._target - self._current
+            step = diff * 0.16
+            if abs(diff) < 80:
+                self._current = self._target
+            else:
+                self._current += step
+
+            ratio  = self._current / self.MAX_PRICE
+            extent = ratio * 180
+
+            # Arc coloré
+            self.delete("arc_fill")
+            if extent > 1:
+                # Vert→ambre→rouge selon ratio
+                if ratio < 0.5:
+                    r_c = int(80  + 160 * ratio * 2)
+                    g_c = int(200 - 40  * ratio * 2)
+                    b_c = 100
+                else:
+                    r_c = 240
+                    g_c = int(160 - 120 * (ratio - 0.5) * 2)
+                    b_c = 50
+                col = f"#{min(r_c,255):02x}{min(g_c,255):02x}{min(b_c,255):02x}"
+                self.create_arc(20, 14, 280, 194,
+                                start=180, extent=extent,
+                                style="arc", outline=col, width=16,
+                                tags="arc_fill")
+
+            # Aiguille
+            self.delete("needle")
+            a  = math.radians(180 - ratio * 180)
+            cx, cy = 150, 150
+            nx = cx + 100 * math.cos(a)
+            ny = cy - 100 * math.sin(a)
+            self.create_line(cx, cy, nx, ny,
+                             fill=_C["ACCENT"], width=3,
+                             capstyle="round", tags="needle")
+            self.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
+                             fill=_C["ACCENT"], outline="",
+                             tags="needle")
+
+            # Texte
+            self.itemconfigure(self._price_id,
+                               text=f"${self._current:,.0f}")
+
+            if abs(self._current - self._target) > 40:
+                self._anim_id = self.after(28, self._animate)
+            else:
+                self._anim_id = None
+
+    # ── Champ de formulaire ──────────────────
+    class FormField(tk.Frame):
+        def __init__(self, parent, label, var,
+                     widget="entry", choices=None, **kw):
+            super().__init__(parent, bg=_C["BG2"], **kw)
+
+            tk.Label(self, text=label,
+                     font=("Segoe UI", 9), fg=_C["TEXT2"],
+                     bg=_C["BG2"], anchor="w", width=24
+                     ).pack(side="left", padx=(0, 6))
+
+            if widget == "combo" and choices:
+                cb = ttk.Combobox(self, textvariable=var,
+                                  values=choices, state="readonly",
+                                  width=22)
+                cb.pack(side="left", fill="x", expand=True)
+                if choices and not var.get():
+                    var.set(choices[0])
+            else:
+                ent = tk.Entry(self, textvariable=var,
+                               bg=_C["BG3"], fg=_C["TEXT"],
+                               insertbackground=_C["ACCENT"],
+                               relief="flat", font=("Segoe UI", 10),
+                               highlightthickness=1,
+                               highlightbackground=_C["BORDER"],
+                               highlightcolor=_C["ACCENT"],
+                               width=24)
+                ent.pack(side="left", fill="x", expand=True)
+
+    # ── Fenêtre principale ───────────────────
+    class PredictApp(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("AutoPredict — Estimation de prix véhicule")
+            self.configure(bg=_C["BG"])
+            self.minsize(1020, 660)
+            setup_styles(self)
+
+            self._vars    = {}
+            self._results = {}
+
+            self._build_header()
+            self._build_body()
+            self._build_statusbar()
+
+        # ── En-tête ──────────────────────────
+        def _build_header(self):
+            hdr = tk.Frame(self, bg=_C["BG"], pady=10)
+            hdr.pack(fill="x", padx=20)
+
+            tk.Label(hdr, text="AUTO",
+                     font=("Segoe UI", 18, "bold"),
+                     fg=_C["ACCENT"], bg=_C["BG"]).pack(side="left")
+            tk.Label(hdr, text="PREDICT",
+                     font=("Segoe UI", 18),
+                     fg=_C["TEXT"], bg=_C["BG"]).pack(side="left")
+
+            info = (f"  ·  entraîné le {meta['trained_at'][:10]}"
+                    f"  ·  {meta['sample_size']:,} véhicules"
+                    f"  ·  meilleur : {BEST_MODEL}"
+                    f"  (R²={RESULTS[BEST_MODEL]['R2']:.3f})")
+            tk.Label(hdr, text=info,
+                     font=("Segoe UI", 8),
+                     fg=_C["TEXT2"], bg=_C["BG"]).pack(side="left", padx=8)
+
+            tk.Frame(self, bg=_C["BORDER"], height=1).pack(fill="x")
+
+        # ── Corps (formulaire gauche + résultats droite) ──
+        def _build_body(self):
+            body = tk.Frame(self, bg=_C["BG"])
+            body.pack(fill="both", expand=True)
+
+            left = tk.Frame(body, bg=_C["BG2"], width=420)
+            left.pack(side="left", fill="y")
+            left.pack_propagate(False)
+
+            tk.Frame(body, bg=_C["BORDER"], width=1).pack(side="left", fill="y")
+
+            right = tk.Frame(body, bg=_C["BG"])
+            right.pack(side="left", fill="both", expand=True)
+
+            self._build_form(left)
+            self._build_results(right)
+
+        # ── Formulaire ───────────────────────
+        def _build_form(self, parent):
+            # Canvas + scrollbar
+            canvas = tk.Canvas(parent, bg=_C["BG2"],
+                               highlightthickness=0)
+            sb     = ttk.Scrollbar(parent, orient="vertical",
+                                   command=canvas.yview)
+            frm    = tk.Frame(canvas, bg=_C["BG2"])
+
+            frm.bind("<Configure>",
+                     lambda e: canvas.configure(
+                         scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=frm, anchor="nw")
+            canvas.configure(yscrollcommand=sb.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+
+            def _scroll(e):
+                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            canvas.bind_all("<MouseWheel>", _scroll)
+
+            def section(title):
+                tk.Label(frm, text=title.upper(),
+                         font=("Segoe UI", 7, "bold"),
+                         fg=_C["ACCENT"], bg=_C["BG2"],
+                         anchor="w").pack(
+                    fill="x", padx=16, pady=(14, 2))
+                tk.Frame(frm, bg=_C["BORDER"],
+                         height=1).pack(fill="x", padx=16, pady=(0, 6))
+
+            def field(label, key, widget="entry", choices=None,
+                      default=None):
+                var = (tk.StringVar(value=str(default) if default is not None else "")
+                       if widget in ("entry", "combo")
+                       else tk.StringVar())
+                self._vars[key] = var
+                ff = FormField(frm, label, var,
+                               widget=widget, choices=choices)
+                ff.pack(fill="x", padx=16, pady=3)
+                if default is not None and isinstance(var, tk.StringVar):
+                    var.set(str(default))
+                return var
+
+            # ── Section 1 ──
+            section("Caractéristiques générales")
+            field("Année de fabrication",   "year",      default=CURRENT_YEAR - 3)
+            field("Kilométrage (km)",        "mileage",   default=50000)
+            if "engine_hp" in NUM_FEATURES:
+                field("Puissance moteur (ch)", "engine_hp", default=150)
+            field("Nb de propriétaires",    "owner_count",      default=1)
+            field("Popularité marque (0–100)", "brand_popularity", default=60)
+
+            # ── Section 2 ──
+            section("Identification du véhicule")
+            field("Marque",       "make",         "combo",
+                  CAT_VALUES.get("make", ["Toyota"]))
+            field("Carrosserie",  "body_type",    "combo",
+                  CAT_VALUES.get("body_type", ["Sedan"]))
+            field("Carburant",    "fuel_type",    "combo",
+                  CAT_VALUES.get("fuel_type", ["Gasoline"]))
+            field("Traction",     "drivetrain",   "combo",
+                  CAT_VALUES.get("drivetrain", ["FWD"]))
+            field("Transmission", "transmission", "combo",
+                  CAT_VALUES.get("transmission", ["Automatic"]))
+
+            # ── Section 3 ──
+            section("Historique & état")
+            field("Accidents",    "accident_history", "combo",
+                  CAT_VALUES.get("accident_history", ["No", "Yes"]))
+            field("Type vendeur", "seller_type",      "combo",
+                  CAT_VALUES.get("seller_type", ["Dealer"]))
+            if ORD_FEATURES:
+                field("Condition", "condition", "combo",
+                      CAT_VALUES.get("condition",
+                                     ["Poor", "Fair", "Good", "Excellent"]))
+
+            # ── Section 4 ──
+            section("Couleurs")
+            field("Couleur extérieure", "exterior_color", "combo",
+                  CAT_VALUES.get("exterior_color", ["White"]))
+            field("Couleur intérieure", "interior_color", "combo",
+                  CAT_VALUES.get("interior_color", ["Black"]))
+
+            # ── Sélecteur modèle + bouton ──
+            tk.Frame(frm, bg=_C["BORDER"], height=1).pack(
+                fill="x", padx=16, pady=(14, 0))
+
+            ctrl = tk.Frame(frm, bg=_C["BG2"])
+            ctrl.pack(fill="x", padx=16, pady=10)
+
+            self._model_var = tk.StringVar(value=BEST_MODEL)
+            model_opts      = AVAILABLE_MODELS + ["— Tous —"]
+            ttk.Combobox(ctrl, textvariable=self._model_var,
+                         values=model_opts, state="readonly",
+                         width=17).pack(side="left", padx=(0, 8))
+
+            ttk.Button(ctrl, text="  Estimer le prix  ",
+                       style="Accent.TButton",
+                       command=self._on_predict
+                       ).pack(side="left", fill="x", expand=True)
+
+            # Batch CSV
+            ttk.Button(frm, text="⬆  Importer CSV (batch)",
+                       style="Ghost.TButton",
+                       command=self._on_batch
+                       ).pack(padx=16, pady=(0, 16), anchor="w")
+
+        # ── Résultats ────────────────────────
+        def _build_results(self, parent):
+            rhead = tk.Frame(parent, bg=_C["BG"], pady=8)
+            rhead.pack(fill="x", padx=24)
+            tk.Label(rhead, text="Résultats",
+                     font=("Segoe UI", 14, "bold"),
+                     fg=_C["TEXT"], bg=_C["BG"]).pack(side="left")
+
+            # Gauge
+            gf = tk.Frame(parent, bg=_C["BG"])
+            gf.pack(pady=4)
+            self._gauge = GaugeMeter(gf)
+            self._gauge.pack()
+            self._gauge_sub = tk.Label(
+                gf,
+                text=f"Meilleur modèle : {BEST_MODEL}",
+                font=("Segoe UI", 8), fg=_C["TEXT2"], bg=_C["BG"]
+            )
+            self._gauge_sub.pack()
+
+            # Séparateur
+            tk.Frame(parent, bg=_C["BORDER"], height=1).pack(
+                fill="x", padx=24, pady=(8, 4))
+
+            # En-tête tableau
+            thead = tk.Frame(parent, bg=_C["BG"])
+            thead.pack(fill="x", padx=24)
+            for txt, w, anchor in [
+                ("Modèle",        20, "w"),
+                ("Prix estimé",   14, "e"),
+                ("R²",             6, "e"),
+                ("MAE",           10, "e"),
+            ]:
+                tk.Label(thead, text=txt,
+                         font=("Segoe UI", 8, "bold"),
+                         fg=_C["TEXT2"], bg=_C["BG"],
+                         width=w, anchor=anchor
+                         ).pack(side="left")
+
+            tk.Frame(parent, bg=_C["BORDER"], height=1).pack(
+                fill="x", padx=24, pady=(2, 4))
+
+            # Corps tableau (remplacé à chaque prédiction)
+            self._table = tk.Frame(parent, bg=_C["BG"])
+            self._table.pack(fill="both", expand=True, padx=24)
+
+            # Log
+            tk.Frame(parent, bg=_C["BORDER"], height=1).pack(
+                fill="x", padx=24, pady=(6, 2))
+            self._log = tk.Text(
+                parent, height=5, bg=_C["BG2"], fg=_C["TEXT2"],
+                font=("Consolas", 9), relief="flat",
+                state="disabled", padx=8, pady=6,
+                insertbackground=_C["TEXT"]
+            )
+            self._log.pack(fill="x", padx=24, pady=(0, 10))
+            self._log_write("Prêt — saisissez les caractéristiques"
+                            " et cliquez sur « Estimer le prix ».")
+
+        # ── Barre de statut ──────────────────
+        def _build_statusbar(self):
+            sb = tk.Frame(self, bg=_C["BG3"], height=22)
+            sb.pack(fill="x", side="bottom")
+            tk.Frame(sb, bg=_C["BORDER"], height=1).pack(fill="x")
+            self._status = tk.StringVar(
+                value=f"Modèles dans : {MODELS_DIR}  ·  "
+                      f"entraîné le {meta['trained_at'][:10]}"
+            )
+            tk.Label(sb, textvariable=self._status,
+                     font=("Segoe UI", 8), fg=_C["TEXT2"],
+                     bg=_C["BG3"], anchor="w", padx=8
+                     ).pack(side="left", fill="x")
+
+        # ── Helpers ──────────────────────────
+        def _log_write(self, msg: str):
+            self._log.configure(state="normal")
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._log.insert("end", f"[{ts}]  {msg}\n")
+            self._log.see("end")
+            self._log.configure(state="disabled")
+
+        def _status_set(self, msg: str):
+            self._status.set(msg)
+
+        def _get_var(self, key: str, fallback=""):
+            v = self._vars.get(key)
+            if v is None:
+                return fallback
+            return v.get()
+
+        def _collect_row(self) -> dict:
+            try:
+                year      = int(self._get_var("year", CURRENT_YEAR - 3))
+                mileage   = float(self._get_var("mileage", 50000))
+                engine_hp = (float(self._get_var("engine_hp", 150))
+                             if "engine_hp" in self._vars else 150.0)
+                owner_cnt = int(self._get_var("owner_count", 1))
+                brand_pop = float(self._get_var("brand_popularity", 60))
+            except ValueError as e:
+                raise ValueError(f"Champ numérique invalide : {e}") from e
+
+            return collect_row_from_values(
+                year, mileage, engine_hp, owner_cnt, brand_pop,
+                self._get_var("make",             "Toyota"),
+                self._get_var("fuel_type",        "Gasoline"),
+                self._get_var("drivetrain",       "FWD"),
+                self._get_var("body_type",        "Sedan"),
+                self._get_var("transmission",     "Automatic"),
+                self._get_var("exterior_color",   "White"),
+                self._get_var("interior_color",   "Black"),
+                self._get_var("seller_type",      "Dealer"),
+                self._get_var("accident_history", "No"),
+                self._get_var("condition",        "Good"),
+            )
+
+        # ── Prédiction ───────────────────────
+        def _on_predict(self):
+            try:
+                row_dict = self._collect_row()
+            except ValueError as e:
+                messagebox.showerror("Erreur de saisie", str(e))
+                return
+
+            sel   = self._model_var.get()
+            names = (AVAILABLE_MODELS if sel == "— Tous —"
+                     else [sel])
+            self._log_write(f"Prédiction → {', '.join(names)} …")
+            self._status_set("Calcul en cours…")
+
+            def worker():
+                results = {}
+                input_df = build_input_df(row_dict)
+                for name in names:
+                    try:
+                        pipe  = load_model(name)
+                        price = predict_price(pipe, input_df.copy())[0]
+                        results[name] = price
+                    except Exception as ex:
+                        results[name] = None
+                        self.after(0, self._log_write,
+                                   f"  ✗ {name} : {ex}")
+                self.after(0, self._show_results, results)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _show_results(self, results: dict):
+            # Vider tableau
+            for w in self._table.winfo_children():
+                w.destroy()
+
+            best_price = None
+
+            for name, price in results.items():
+                r       = RESULTS[name]
+                is_best = (name == BEST_MODEL)
+                row_bg  = _C["BG4"] if is_best else _C["BG"]
+
+                row_f = tk.Frame(self._table, bg=row_bg)
+                row_f.pack(fill="x", pady=1)
+
+                prefix = "★ " if is_best else "  "
+                tk.Label(row_f,
+                         text=f"{prefix}{name}",
+                         font=("Segoe UI", 9,
+                               "bold" if is_best else "normal"),
+                         fg=_C["ACCENT"] if is_best else _C["TEXT"],
+                         bg=row_bg, width=20, anchor="w"
+                         ).pack(side="left", padx=(4, 0))
+
+                price_txt = (f"${price:>12,.0f}"
+                             if price is not None else "     erreur")
+                price_fg  = (_C["SUCCESS"] if price is not None
+                             else _C["DANGER"])
+                tk.Label(row_f, text=price_txt,
+                         font=("Consolas", 10, "bold"),
+                         fg=price_fg, bg=row_bg,
+                         width=14, anchor="e"
+                         ).pack(side="left")
+
+                tk.Label(row_f, text=f"{r['R2']:.3f}",
+                         font=("Consolas", 9),
+                         fg=_C["TEXT2"], bg=row_bg,
+                         width=6, anchor="e"
+                         ).pack(side="left")
+
+                tk.Label(row_f, text=f"${r['MAE']:>9,.0f}",
+                         font=("Consolas", 9),
+                         fg=_C["TEXT2"], bg=row_bg,
+                         width=10, anchor="e"
+                         ).pack(side="left")
+
+                if is_best and price is not None:
+                    best_price = price
+
+            if best_price is not None:
+                self._gauge.set_value(best_price)
+                self._log_write(
+                    f"  ✓ Estimation (meilleur modèle) : "
+                    f"${best_price:,.0f}")
+                self._status_set(
+                    f"Dernière estimation : ${best_price:,.0f}"
+                    f" via {BEST_MODEL}")
+            else:
+                self._status_set("Prédiction terminée.")
+
+            self._results = results
+
+        # ── Batch CSV ────────────────────────
+        def _on_batch(self):
+            path = filedialog.askopenfilename(
+                title="Choisir un fichier CSV",
+                filetypes=[("CSV", "*.csv"), ("Tous", "*.*")]
+            )
+            if not path:
+                return
+
+            csv_path = Path(path)
+            self._log_write(f"Batch : {csv_path.name}")
+            self._status_set("Batch en cours…")
+
+            def worker():
+                try:
+                    df = pd.read_csv(csv_path)
+                    df.columns = df.columns.str.strip().str.lower()
+                    self.after(0, self._log_write,
+                               f"  {len(df):,} lignes chargées")
+
+                    out = df.copy()
+                    for name in AVAILABLE_MODELS:
+                        pipe  = load_model(name)
+                        preds = predict_price(pipe, df.copy())
+                        out[f"predicted_price_{name}"] = preds.round(2)
+                        med = float(np.median(preds))
+                        self.after(0, self._log_write,
+                                   f"  {name} → médiane ${med:,.0f}")
+
+                    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    outp  = csv_path.parent / f"predictions_output_{ts}.csv"
+                    out.to_csv(outp, index=False)
+                    self.after(0, self._log_write,
+                               f"  ✓ Exporté : {outp.name}")
+                    self.after(0, self._status_set,
+                               f"Batch terminé → {outp.name}")
+                    self.after(0, messagebox.showinfo,
+                               "Batch terminé",
+                               f"Résultats exportés :\n{outp}")
+                except Exception as ex:
+                    self.after(0, self._log_write,
+                               f"  ✗ Erreur batch : {ex}")
+                    self.after(0, self._status_set,
+                               "Batch : erreur.")
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    app = PredictApp()
+    app.mainloop()
+
+
+# ─────────────────────────────────────────────
+# POINT D'ENTRÉE
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    if args.cli:
+        run_cli()
+    else:
+        run_gui()
