@@ -2,7 +2,7 @@
 =============================================================
   PREDICT.PY — Prédiction sans réentraînement
   Branch : feature/model-persistence
-=============================================================
+==============================================p===============
   Prérequis : avoir exécuté train.py au moins une fois.
 
   Usages :
@@ -263,26 +263,26 @@ for col, val in input_df.iloc[0].items():
 # ─────────────────────────────────────────────
 # 4. PRÉDICTIONS
 # ─────────────────────────────────────────────
-print(f"\n{'─'*60}")
-print(f"  {'Modèle':<22} {'Prix estimé':>12}  {'R² (test)':>10}  {'MAE':>10}")
-print(f"{'─'*60}")
+print(f"\n{'-'*70}")
+print(f"  {'Model':<22} {'Estimated Price':>16}  {'R2 (test)':>10}  {'MAE':>11}")
+print(f"{'-'*70}")
 
-if args.all:
-    model_names = AVAILABLE_MODELS
-elif args.model:
+if args.model:
     if args.model not in AVAILABLE_MODELS:
         print(f"\nERREUR : modèle '{args.model}' inconnu. Disponibles : {AVAILABLE_MODELS}")
         sys.exit(1)
     model_names = [args.model]
+elif args.all:
+    model_names = AVAILABLE_MODELS
 else:
-    model_names = [BEST_MODEL]
+    model_names = AVAILABLE_MODELS  # Show all models by default
 
 for name in model_names:
     pipe        = load_model(name)
     pred        = predict_price(pipe, input_df.copy())[0]
     r           = RESULTS[name]
-    star        = " ⭐" if name == BEST_MODEL else ""
-    print(f"  {name:<22} {pred:>10,.0f} $   {r['R2']:>9.3f}   ${r['MAE']:>9,.0f}{star}")
+    star        = " [BEST]" if name ==BEST_MODEL else ""
+    print(f"  {name:<22} ${pred:>11,.2f}   R²={r['R2']:.3f}   MAE=${r['MAE']:>9,.0f}{star}")
 
 print(f"{'─'*60}")
 print(f"\n  Entraînement effectué le : {meta['trained_at'][:19]}")
