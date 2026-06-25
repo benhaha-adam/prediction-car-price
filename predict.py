@@ -1,116 +1,88 @@
-import streamlit as st
-import numpy as np
+# core.py
+import warnings
+warnings.filterwarnings("ignore")
+
 import json
-import threading
-from pathlib import Path
-import joblib
+import math
+import numpy as np
 import pandas as pd
+import joblib
+from pathlib import Path
+from datetime import datetime
 
-# ── Reuse all your existing logic ──────────────────────────
-from predict import (
-    meta, ALL_FEATURES, NUM_FEATURES, CAT_FEATURES, ORD_FEATURES,
-    BEST_MODEL, AVAILABLE_MODELS, CAT_VALUES, CURRENT_YEAR, RESULTS,
-    load_model, predict_price, build_input_df, collect_row_from_values,
-)
+MODELS_DIR = Path("models/")
 
-# ── Page config ────────────────────────────────────────────
-st.set_page_config(
-    page_title="AutoPredict",
-    page_icon="🚗",
-    layout="wide"
-)
+meta_path = MODELS_DIR / "training_metadata.json"
+with open(meta_path, "r", encoding="utf-8") as f:
+    meta = json.load(f)
 
-st.title("🚗 AutoPredict — Estimation de prix véhicule")
-st.caption(
-    f"Entraîné le {meta['trained_at'][:10]}  ·  "
-    f"{meta['sample_size']:,} véhicules  ·  "
-    f"Meilleur modèle : **{BEST_MODEL}** (R²={RESULTS[BEST_MODEL]['R2']:.3f})"
-)
+ALL_FEATURES     = meta["all_features"]
+NUM_FEATURES     = meta["num_features"]
+CAT_FEATURES     = meta["cat_features"]
+ORD_FEATURES     = meta["ord_features"]
+BEST_MODEL       = meta["best_model"]
+AVAILABLE_MODELS = meta["models"]
+CAT_VALUES       = meta["cat_values"]
+CURRENT_YEAR     = meta["current_year"]
+RESULTS          = meta["results"]
 
-# ── Sidebar = your form ────────────────────────────────────
-st.sidebar.header("Caractéristiques du véhicule")
 
-year       = st.sidebar.number_input("Année de fabrication", 1990, CURRENT_YEAR, CURRENT_YEAR - 3)
-mileage    = st.sidebar.number_input("Kilométrage (km)", 0, 500_000, 50_000, step=1000)
-engine_hp  = st.sidebar.number_input("Puissance moteur (ch)", 50, 1500, 150) if "engine_hp" in NUM_FEATURES else 150
-owner_count = st.sidebar.number_input("Nb de propriétaires", 0, 20, 1)
-brand_pop  = st.sidebar.slider("Popularité marque (0–100)", 0, 100, 60)
+def safe_div(a, b, fallback=1.0):
+    return a / b if b != 0 else fallback
 
-make         = st.sidebar.selectbox("Marque",             CAT_VALUES.get("make", ["Toyota"]))
-body_type    = st.sidebar.selectbox("Carrosserie",        CAT_VALUES.get("body_type", ["Sedan"]))
-fuel_type    = st.sidebar.selectbox("Carburant",          CAT_VALUES.get("fuel_type", ["Gasoline"]))
-drivetrain   = st.sidebar.selectbox("Traction",           CAT_VALUES.get("drivetrain", ["FWD"]))
-transmission = st.sidebar.selectbox("Transmission",       CAT_VALUES.get("transmission", ["Automatic"]))
-accident     = st.sidebar.selectbox("Accidents",          CAT_VALUES.get("accident_history", ["No", "Yes"]))
-seller_type  = st.sidebar.selectbox("Type de vendeur",    CAT_VALUES.get("seller_type", ["Dealer"]))
-ext_color    = st.sidebar.selectbox("Couleur extérieure", CAT_VALUES.get("exterior_color", ["White"]))
-int_color    = st.sidebar.selectbox("Couleur intérieure", CAT_VALUES.get("interior_color", ["Black"]))
-condition    = st.sidebar.selectbox("Condition",          CAT_VALUES.get("condition", ["Poor", "Fair", "Good", "Excellent"])) if ORD_FEATURES else "Good"
 
-model_choice = st.sidebar.selectbox(
-    "Modèle à utiliser",
-    ["— Tous —"] + AVAILABLE_MODELS,
-    index=AVAILABLE_MODELS.index(BEST_MODEL) + 1
-)
+def load_model(name: str):
+    path = MODELS_DIR / f"{name}.joblib"
+    return joblib.load(path)
 
-predict_btn = st.sidebar.button("✨ Estimer le prix", type="primary", use_container_width=True)
 
-# ── Results area ───────────────────────────────────────────
-if predict_btn:
-    row_dict = collect_row_from_values(
-        year, mileage, engine_hp, owner_count, brand_pop,
-        make, fuel_type, drivetrain, body_type, transmission,
-        ext_color, int_color, seller_type, accident, condition,
+def apply_feature_engineering(data: pd.DataFrame) -> pd.DataFrame:
+    if "year" not in data.columns or "car_age" in data.columns:
+        return data
+    data = data.copy()
+    data["car_age"] = (CURRENT_YEAR - data["year"]).clip(lower=0)
+    age_safe = np.where(data["car_age"] == 0, 1, data["car_age"])
+    if "mileage" in data.columns:
+        data["mileage_per_year"] = data["mileage"] / age_safe
+    if "engine_hp" in data.columns:
+        data["hp_per_year"] = data["engine_hp"] / age_safe
+    return data
+
+
+def predict_price(pipe, data: pd.DataFrame) -> np.ndarray:
+    data = apply_feature_engineering(data)
+    for col in ALL_FEATURES:
+        if col not in data.columns:
+            data[col] = np.nan
+    data = data[ALL_FEATURES]
+    y_log  = pipe.predict(data)
+    return np.clip(np.expm1(y_log), a_min=0, a_max=None)
+
+
+def build_input_df(row_dict: dict) -> pd.DataFrame:
+    row = {k: v for k, v in row_dict.items() if k in ALL_FEATURES}
+    for col in ALL_FEATURES:
+        if col not in row:
+            row[col] = np.nan
+    return pd.DataFrame([row])[ALL_FEATURES]
+
+
+def collect_row_from_values(
+    year, mileage, engine_hp, owner_count, brand_popularity,
+    make, fuel_type, drivetrain, body_type, transmission,
+    exterior_color, interior_color, seller_type, accident_history,
+    condition
+) -> dict:
+    car_age          = max(CURRENT_YEAR - int(year), 0)
+    mileage_per_year = safe_div(float(mileage), max(car_age, 1))
+    hp_per_year      = safe_div(float(engine_hp), max(car_age, 1))
+    return dict(
+        year=int(year), mileage=float(mileage), engine_hp=float(engine_hp),
+        owner_count=int(owner_count), brand_popularity=float(brand_popularity),
+        car_age=car_age, mileage_per_year=mileage_per_year, hp_per_year=hp_per_year,
+        make=str(make), fuel_type=str(fuel_type), drivetrain=str(drivetrain),
+        body_type=str(body_type), transmission=str(transmission),
+        exterior_color=str(exterior_color), interior_color=str(interior_color),
+        seller_type=str(seller_type), accident_history=str(accident_history),
+        condition=str(condition),
     )
-    input_df = build_input_df(row_dict)
-    names = AVAILABLE_MODELS if model_choice == "— Tous —" else [model_choice]
-
-    rows = []
-    with st.spinner("Calcul en cours…"):
-        for name in names:
-            pipe  = load_model(name)
-            price = predict_price(pipe, input_df.copy())[0]
-            r     = RESULTS[name]
-            rows.append({
-                "Modèle":       ("⭐ " if name == BEST_MODEL else "") + name,
-                "Prix estimé":  f"${price:,.0f}",
-                "R²":           f"{r['R2']:.3f}",
-                "MAE":          f"${r['MAE']:,.0f}",
-                "_price":       price,
-                "_best":        name == BEST_MODEL,
-            })
-
-    best_row = next((r for r in rows if r["_best"]), rows[0])
-    best_price = best_row["_price"]
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("💰 Prix estimé (meilleur modèle)", f"${best_price:,.0f}")
-    col2.metric("Modèle", BEST_MODEL)
-    col3.metric("R²", f"{RESULTS[BEST_MODEL]['R2']:.3f}")
-
-    st.divider()
-
-    display = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-    st.dataframe(display, use_container_width=True, hide_index=True)
-
-# ── Batch CSV ──────────────────────────────────────────────
-st.divider()
-st.subheader("📂 Batch — Importer un CSV")
-uploaded = st.file_uploader("Choisir un fichier CSV", type="csv")
-if uploaded:
-    df = pd.read_csv(uploaded)
-    df.columns = df.columns.str.strip().str.lower()
-    st.write(f"{len(df):,} lignes chargées")
-
-    if st.button("Lancer le batch sur tous les modèles"):
-        out = df.copy()
-        with st.spinner("Prédiction batch…"):
-            for name in AVAILABLE_MODELS:
-                pipe  = load_model(name)
-                preds = predict_price(pipe, df.copy())
-                out[f"predicted_price_{name}"] = preds.round(2)
-        st.success("Batch terminé !")
-        st.dataframe(out, use_container_width=True)
-        csv_bytes = out.to_csv(index=False).encode()
-        st.download_button("⬇ Télécharger les résultats", csv_bytes,
-                           "predictions_output.csv", "text/csv")
