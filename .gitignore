@@ -2,7 +2,7 @@
 csv/
 
 # Trained model
-models/
+# keep models tracked so deployed app can load the joblib file
 
 # Python cache
 __pycache__/

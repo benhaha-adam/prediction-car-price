@@ -1,0 +1,177 @@
+{
+  "trained_at": "2026-06-24T19:58:40.830564",
+  "sample_size": 300000,
+  "current_year": 2026,
+  "target": "price",
+  "num_features": [
+    "year",
+    "mileage",
+    "engine_hp",
+    "owner_count",
+    "brand_popularity",
+    "car_age",
+    "mileage_per_year",
+    "hp_per_year"
+  ],
+  "cat_features": [
+    "make",
+    "fuel_type",
+    "drivetrain",
+    "body_type",
+    "transmission",
+    "exterior_color",
+    "interior_color",
+    "seller_type",
+    "accident_history"
+  ],
+  "ord_features": [
+    "condition"
+  ],
+  "all_features": [
+    "year",
+    "mileage",
+    "engine_hp",
+    "owner_count",
+    "brand_popularity",
+    "car_age",
+    "mileage_per_year",
+    "hp_per_year",
+    "make",
+    "fuel_type",
+    "drivetrain",
+    "body_type",
+    "transmission",
+    "exterior_color",
+    "interior_color",
+    "seller_type",
+    "accident_history",
+    "condition"
+  ],
+  "condition_order": [
+    [
+      "Poor",
+      "Fair",
+      "Good",
+      "Excellent"
+    ]
+  ],
+  "best_model": "xgboost",
+  "models": [
+    "ridge",
+    "decision_tree",
+    "random_forest",
+    "gradient_boosting",
+    "xgboost"
+  ],
+  "results": {
+    "ridge": {
+      "MAE": 3065.3751579817445,
+      "RMSE": 4988.632162724325,
+      "R2": 0.8669428588022672,
+      "CV_R2": 0.9378170224445114
+    },
+    "decision_tree": {
+      "MAE": 2089.690967480686,
+      "RMSE": 2934.071224510974,
+      "R2": 0.9539725910397207,
+      "CV_R2": 0.9637188104161835
+    },
+    "random_forest": {
+      "MAE": 1482.6206893351603,
+      "RMSE": 2108.794186198905,
+      "R2": 0.9762237359831197,
+      "CV_R2": 0.9832847703296542
+    },
+    "gradient_boosting": {
+      "MAE": 1433.4669047399168,
+      "RMSE": 2089.524646158754,
+      "R2": 0.9766562717132985,
+      "CV_R2": 0.9841431538694737
+    },
+    "xgboost": {
+      "MAE": 1167.5279390691326,
+      "RMSE": 1711.0778100118978,
+      "R2": 0.9843463816232207,
+      "CV_R2": 0.9908016110890688
+    }
+  },
+  "cat_values": {
+    "make": [
+      "Acura",
+      "Audi",
+      "BMW",
+      "Cadillac",
+      "Chevrolet",
+      "Chrysler",
+      "Dodge",
+      "Ford",
+      "GMC",
+      "Honda",
+      "Hyundai",
+      "Jeep",
+      "Kia",
+      "Land Rover",
+      "Lexus",
+      "Mazda",
+      "Mercedes-Benz",
+      "Nissan",
+      "Porsche",
+      "Ram",
+      "Subaru",
+      "Tesla",
+      "Toyota",
+      "Volkswagen",
+      "Volvo"
+    ],
+    "fuel_type": [
+      "Diesel",
+      "Electric",
+      "Gasoline"
+    ],
+    "drivetrain": [
+      "AWD",
+      "FWD",
+      "RWD"
+    ],
+    "body_type": [
+      "Coupe",
+      "Hatchback",
+      "Minivan",
+      "Pickup Truck",
+      "SUV",
+      "Sedan",
+      "Wagon"
+    ],
+    "transmission": [
+      "Automatic",
+      "Manual"
+    ],
+    "exterior_color": [
+      "Black",
+      "Blue",
+      "Gray",
+      "Red",
+      "Silver",
+      "White"
+    ],
+    "interior_color": [
+      "Beige",
+      "Black",
+      "Brown",
+      "Gray"
+    ],
+    "seller_type": [
+      "Dealer",
+      "Private"
+    ],
+    "accident_history": [
+      "Major",
+      "Minor"
+    ],
+    "condition": [
+      "Excellent",
+      "Fair",
+      "Good"
+    ]
+  }
+}
