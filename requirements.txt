@@ -1,12 +1,7 @@
-# ─── Pin these to whatever `python -c "import X; print(X.__version__)"` gives
-# you locally — the version you used when running train.py.
-# Mismatched versions = pickle can't deserialize your .joblib files.
-
-scikit-learn==1.4.2       # ← replace with YOUR version
-numpy==1.26.4             # ← replace with YOUR version
-pandas==2.2.2             # ← replace with YOUR version
-joblib==1.4.0             # ← replace with YOUR version
-
-# ─── These don't need to match exactly
 streamlit>=1.32.0
-plotly>=5.18.0
+numpy
+pandas
+scikit-learn
+joblib
+plotly
+xgboost

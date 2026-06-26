@@ -492,7 +492,7 @@ def render_sidebar() -> dict:
         )
 
         predict_btn = st.button("🔍 Estimate Price",
-                                use_container_width=True)
+                                use_container_width=True)  # buttons keep this param
 
     return dict(
         year=year, mileage=mileage, engine_hp=engine_hp,
@@ -623,7 +623,7 @@ def main() -> None:
             with col_gauge:
                 st.plotly_chart(
                     make_gauge(best_price, best_name),
-                    use_container_width=True,
+                    width="stretch",
                     config={"displayModeBar": False},
                 )
 
@@ -644,7 +644,7 @@ def main() -> None:
             with st.expander("📋 Input features used for this prediction"):
                 st.dataframe(
                     input_df.T.rename(columns={0: "value"}),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         else:
@@ -673,7 +673,7 @@ def main() -> None:
             df = pd.read_csv(uploaded)
             df.columns = df.columns.str.strip().str.lower()
             st.write(f"**{len(df):,} rows loaded** — preview (first 5):")
-            st.dataframe(df.head(), use_container_width=True)
+            st.dataframe(df.head(), width="stretch")
 
             if st.button("▶ Run batch predictions", key="batch_run"):
                 out = df.copy()
@@ -704,7 +704,7 @@ def main() -> None:
                     })
                 st.dataframe(
                     pd.DataFrame(summary_rows).set_index("Model"),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
                 # Download
@@ -733,7 +733,7 @@ def main() -> None:
                 "Best":     "★" if name == BEST_MODEL else "",
             })
         perf_df = pd.DataFrame(rows).set_index("Model")
-        st.dataframe(perf_df, use_container_width=True)
+        st.dataframe(perf_df, width="stretch")
 
         # R² bar chart
         fig_bar = go.Figure(go.Bar(
@@ -766,7 +766,7 @@ def main() -> None:
             margin=dict(l=20, r=20, t=50, b=20),
             height=320,
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
 
 
 # ─────────────────────────────────────────────
